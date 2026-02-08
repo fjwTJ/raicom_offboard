@@ -38,7 +38,7 @@
  * @author Mickey Cowden <info@cowden.tech>
  * @author Nuno Marques <nuno.marques@dronesolutions.io>
  */
-
+// This example demonstrates offboard control using PX4 services to switch to offboard mode and arm the vehicle.
 #include <px4_msgs/msg/offboard_control_mode.hpp>
 #include <px4_msgs/msg/trajectory_setpoint.hpp>
 #include <px4_msgs/msg/vehicle_control_mode.hpp>
