@@ -25,6 +25,10 @@ find_package(px4_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(rclpy REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
 
 #################
 # Setup targets #
@@ -65,6 +69,20 @@ install(TARGETS offboard_control DESTINATION lib/${PROJECT_NAME})
 add_executable(offboard_control_srv src/examples/offboard/offboard_control_srv.cpp)
 ament_target_dependencies(offboard_control_srv rclcpp px4_msgs)
 install(TARGETS offboard_control_srv DESTINATION lib/${PROJECT_NAME})
+# examples/offboard/fix_tf_static
+add_executable(fix_tf_static src/examples/offboard/fix-tf-static.cpp)
+
+ament_target_dependencies(fix_tf_static
+  rclcpp
+  geometry_msgs
+  tf2
+  tf2_ros
+)
+
+install(TARGETS
+  fix_tf_static
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 
 ############
