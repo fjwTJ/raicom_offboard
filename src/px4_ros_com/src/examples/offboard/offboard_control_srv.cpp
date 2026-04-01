@@ -1,289 +1,277 @@
-/****************************************************************************
- *
- * Copyright 2023 PX4 Development Team. All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- * list of conditions and the following disclaimer.
- *
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- * this list of conditions and the following disclaimer in the documentation
- * and/or other materials provided with the distribution.
- *
- * 3. Neither the name of the copyright holder nor the names of its contributors
- * may be used to endorse or promote products derived from this software without
- * specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
- *
- ****************************************************************************/
+#include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/image.hpp"
+#include "cv_bridge/cv_bridge.h"
+#include "opencv2/opencv.hpp"
+#include "opencv2/imgproc.hpp"
+#include "px4_msgs/srv/detect_color.hpp"
+#include "px4_msgs/msg/vehicle_odometry.hpp"
+#include <mutex>
+#include <map>
+#include <atomic>
+#include <vector>
+#include <algorithm>
+#include <cmath>
+#include "geometry_msgs/msg/point_stamped.hpp"
+#include "tf2_ros/buffer.h"
+#include "tf2_ros/transform_listener.h"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+#include "fix-tf-static.hpp"
 
-/**
- * @brief Offboard control example
- * @file offboard_control.cpp
- * @addtogroup examples * 
- * @author Beniamino Pozzan <beniamino.pozzan@gmail.com>
- * @author Mickey Cowden <info@cowden.tech>
- * @author Nuno Marques <nuno.marques@dronesolutions.io>
- */
-
-#include <px4_msgs/msg/offboard_control_mode.hpp>
-#include <px4_msgs/msg/trajectory_setpoint.hpp>
-#include <px4_msgs/msg/vehicle_control_mode.hpp>
-#include <px4_msgs/srv/vehicle_command.hpp>
-#include <rclcpp/rclcpp.hpp>
-#include <stdint.h>
-
-#include <chrono>
-#include <iostream>
-#include <string>
-
-using namespace std::chrono;
 using namespace std::chrono_literals;
-using namespace px4_msgs::msg;
+using DetectColor = px4_msgs::srv::DetectColor;
 
-class OffboardControl : public rclcpp::Node
-{
+class ColorDetectionService : public rclcpp::Node {
 public:
-	OffboardControl(std::string px4_namespace) :
-		Node("offboard_control_srv"),
-		state_{State::init},
-		service_result_{0},
-		service_done_{false},
-		offboard_control_mode_publisher_{this->create_publisher<OffboardControlMode>(px4_namespace+"in/offboard_control_mode", 10)},
-		trajectory_setpoint_publisher_{this->create_publisher<TrajectorySetpoint>(px4_namespace+"in/trajectory_setpoint", 10)},
-		vehicle_command_client_{this->create_client<px4_msgs::srv::VehicleCommand>(px4_namespace+"vehicle_command")}
-	{
-		RCLCPP_INFO(this->get_logger(), "Starting Offboard Control example with PX4 services");
-		RCLCPP_INFO_STREAM(this->get_logger(), "Waiting for " << px4_namespace << "vehicle_command service");
-		while (!vehicle_command_client_->wait_for_service(1s)) {
-			if (!rclcpp::ok()) {
-				RCLCPP_ERROR(this->get_logger(), "Interrupted while waiting for the service. Exiting.");
-				return;
-			}
-			RCLCPP_INFO(this->get_logger(), "service not available, waiting again...");
-		}
+    ColorDetectionService() : Node("color_detection_service") {
+        // 创建颜色检测服务
+        service_ = this->create_service<DetectColor>(
+            "detect_color",
+            std::bind(&ColorDetectionService::handle_detect_color, this, 
+                      std::placeholders::_1, std::placeholders::_2));
+        
+        // 订阅相机画面
+        subscription_ = this->create_subscription<sensor_msgs::msg::Image>(
+            "/camera", 10,
+            std::bind(&ColorDetectionService::image_callback, this, std::placeholders::_1));
 
-		timer_ = this->create_wall_timer(100ms, std::bind(&OffboardControl::timer_callback, this));
-	}
+        // 订阅PX4姿态信息
+        odom_sub_ = this->create_subscription<px4_msgs::msg::VehicleOdometry>(
+            "/fmu/out/vehicle_odometry", 10,
+            std::bind(&ColorDetectionService::odom_callback, this, std::placeholders::_1));
 
-	void switch_to_offboard_mode();
-	void arm();
-	void disarm();
+        // TF 相关初始化
+         static_tf_helper_ = std::make_shared<StaticCameraTFHelper>(this);
+
+         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
+        // 发布静态相机 -> 机体变换
+        // 后续需要改参数
+         static_tf_helper_->publishCameraToBodyTF(
+        "uav_base_link",   // 父坐标系：机体
+         "camera_link",     // 子坐标系：相机
+        0.0, 0.0, 0.0,     // x y z
+         0.0, 0.0, 0.0      // roll pitch yaw);
+
+        // 初始化颜色阈值映射表
+        color_thresholds_["red"]   = std::make_pair(cv::Scalar(0, 200, 150),  cv::Scalar(10, 255, 230));
+        color_thresholds_["green"] = std::make_pair(cv::Scalar(50, 200, 150), cv::Scalar(70, 255, 230));
+        color_thresholds_["blue"]  = std::make_pair(cv::Scalar(110, 200, 150),cv::Scalar(130, 255, 230));
+        color_thresholds_["black"] = std::make_pair(cv::Scalar(0, 0, 50),     cv::Scalar(180, 50, 100));
+        
+        cv::namedWindow("Camera Feed", cv::WINDOW_AUTOSIZE);
+        RCLCPP_INFO(this->get_logger(), "Color detection service ready, waiting for requests...");
+    }
+
+    ~ColorDetectionService() {
+        cv::destroyAllWindows();
+    }
 
 private:
-	enum class State{
-		init,
-		offboard_requested,
-		wait_for_stable_offboard_mode,
-		arm_requested,
-		armed
-	} state_;
-	uint8_t service_result_;
-	bool service_done_;
-	rclcpp::TimerBase::SharedPtr timer_;
+    // --- 新增 TF 成员 --- 
+    std::shared_ptr<StaticCameraTFHelper> static_tf_helper_;
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+    // --- ROS 组件 ---
+    rclcpp::Service<DetectColor>::SharedPtr service_;
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr subscription_;
+    rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr odom_sub_;
 
-	rclcpp::Publisher<OffboardControlMode>::SharedPtr offboard_control_mode_publisher_;
-	rclcpp::Publisher<TrajectorySetpoint>::SharedPtr trajectory_setpoint_publisher_;
-	rclcpp::Client<px4_msgs::srv::VehicleCommand>::SharedPtr vehicle_command_client_;
+    // --- 图像数据 ---
+    cv::Mat current_frame_;
+    std::mutex frame_mutex_;
 
+    // --- 姿态缓存 ---
+    double current_yaw_ = 0.0;
+    std::mutex odom_mutex_;
 
-	void publish_offboard_control_mode();
-	void publish_trajectory_setpoint();
-	void request_vehicle_command(uint16_t command, float param1 = 0.0, float param2 = 0.0);
-	void response_callback(rclcpp::Client<px4_msgs::srv::VehicleCommand>::SharedFuture future);
-	void timer_callback(void);
+    // --- 检测状态 ---
+    std::map<std::string, std::pair<cv::Scalar, cv::Scalar>> color_thresholds_;
+    std::atomic<bool> detection_active_{false};
+    std::string active_color_;
+    std::mutex detection_mutex_;
+    double service_x_;
+    double service_y_;
+
+    // -------------------- 图像回调 --------------------
+    void image_callback(const sensor_msgs::msg::Image::SharedPtr msg) {
+        try {
+            cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, "bgr8");
+            {
+                std::lock_guard<std::mutex> lock(frame_mutex_);
+                current_frame_ = cv_ptr->image.clone();
+            }
+
+            cv::Mat display_frame = current_frame_.clone();
+            if (detection_active_) {
+                std::lock_guard<std::mutex> det_lock(detection_mutex_);
+                process_frame(display_frame, active_color_);
+            }
+
+            cv::imshow("Camera Feed", display_frame);
+            cv::waitKey(1);
+        } catch (const cv_bridge::Exception &e) {
+            RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
+        }
+    }
+
+    // -------------------- 姿态回调 --------------------
+    void odom_callback(const px4_msgs::msg::VehicleOdometry::SharedPtr msg) {
+        double q0 = msg->q[0];
+        double q1 = msg->q[1];
+        double q2 = msg->q[2];
+        double q3 = msg->q[3];
+        double yaw = std::atan2(2.0 * (q0*q3 + q1*q2),
+                                1.0 - 2.0 * (q2*q2 + q3*q3));
+        std::lock_guard<std::mutex> lock(odom_mutex_);
+        current_yaw_ = yaw;
+    }
+
+    // -------------------- 颜色检测 --------------------
+    bool process_frame(cv::Mat &image, const std::string &color) {
+        if (color_thresholds_.find(color) == color_thresholds_.end()) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
+                                "Unsupported color: %s", color.c_str());
+            return false;
+        }
+
+        auto &thresholds = color_thresholds_[color];
+        cv::Mat hsv_img, mask_color;
+        cv::cvtColor(image, hsv_img, cv::COLOR_BGR2HSV);
+        cv::inRange(hsv_img, thresholds.first, thresholds.second, mask_color);
+
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5,5));
+        cv::morphologyEx(mask_color, mask_color, cv::MORPH_OPEN, kernel);
+        cv::morphologyEx(mask_color, mask_color, cv::MORPH_CLOSE, kernel);
+
+        std::vector<std::vector<cv::Point>> contours;
+        cv::findContours(mask_color, contours, cv::RETR_LIST, cv::CHAIN_APPROX_NONE);
+        if (contours.empty()) {
+            cv::putText(image, "No " + color + " object", cv::Point(20,40),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0,0,255), 2);
+            return false;
+        }
+
+        auto max_contour = *std::max_element(contours.begin(), contours.end(),
+            [](const auto &a, const auto &b){ return cv::contourArea(a) < cv::contourArea(b); });
+        cv::Rect rect = cv::boundingRect(max_contour);
+        int x = rect.x, y = rect.y, w = rect.width, h = rect.height;
+        double img_cx = image.cols / 2.0, img_cy = image.rows / 2.0;
+        double obj_cx = x + w / 2.0, obj_cy = y + h / 2.0;
+
+        double rel_x = -(obj_cy - img_cy); // 上为正
+        double rel_y =  (obj_cx - img_cx); // 右为正
+   
+        // 计算像素到米的比例（物体实际尺寸1m x 1m）
+        double pixel_to_meter_x = 1.0 / w;
+        double pixel_to_meter_y = 1.0 / h;
+
+        // 相机系平面下的位移
+        service_x_ = rel_x * pixel_to_meter_x;
+        service_y_ = rel_y * pixel_to_meter_y;
+
+        cv::rectangle(image, rect, cv::Scalar(0,255,0), 2);
+        cv::circle(image, cv::Point(obj_cx, obj_cy), 5, cv::Scalar(0,255,0), -1);
+        return true;
+    }
+
+    // -------------------- 服务回调 --------------------
+    void handle_detect_color(const std::shared_ptr<DetectColor::Request> request,
+                             std::shared_ptr<DetectColor::Response> response) {
+        std::string color = request->color;
+        RCLCPP_INFO(this->get_logger(), "Service request for color: %s", color.c_str());
+
+        if (color_thresholds_.find(color) == color_thresholds_.end()) {
+            response->success = false;
+            RCLCPP_WARN(this->get_logger(), "Unsupported color: %s", color.c_str());
+            return;
+        }
+
+        cv::Mat frame_copy;
+        {
+            std::lock_guard<std::mutex> lock(frame_mutex_);
+            if (current_frame_.empty()) {
+                response->success = false;
+                RCLCPP_WARN(this->get_logger(), "No frame available for service request");
+                return;
+            }
+            frame_copy = current_frame_.clone();
+        }
+
+        {
+            std::lock_guard<std::mutex> det_lock(detection_mutex_);
+            detection_active_ = true;
+            active_color_ = color;
+        }
+
+        bool success = process_frame(frame_copy, color);
+
+       //相机->机体->世界坐标变换
+        if (success) {
+           geometry_msgs::msg::PointStamped point_cam;
+           geometry_msgs::msg::PointStamped point_body;
+
+             // 1. 把检测结果封装成 camera_link 下的点
+    point_cam.header.stamp = this->get_clock()->now();
+    point_cam.header.frame_id = "camera_link";
+    point_cam.point.x = service_x_;
+    point_cam.point.y = service_y_;
+    point_cam.point.z = 0.0;   // 当前先按二维平面处理
+
+    // 2. 查询 camera_link -> uav_base_link 的变换
+    try {
+        auto transform = tf_buffer_->lookupTransform(
+            "uav_base_link",   // 目标坐标系
+            "camera_link",     // 源坐标系
+            tf2::TimePointZero);
+
+        // 3. 把点从相机系变到机体系
+        tf2::doTransform(point_cam, point_body, transform);
+    } catch (const tf2::TransformException & ex) {
+        response->success = false;
+        RCLCPP_ERROR(this->get_logger(), "TF transform failed: %s", ex.what());
+        return;
+    }
+
+    // 4. 现在才真正得到机体系偏移
+    double dx_body = point_body.point.x;
+    double dy_body = point_body.point.y;
+
+    // --- 获取当前yaw ---
+    double yaw = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(odom_mutex_);
+        yaw = current_yaw_;
+    }
+
+    // --- 机体 -> 世界NED ---
+    double cy = std::cos(yaw);
+    double sy = std::sin(yaw);
+    double dx_world = cy * dx_body - sy * dy_body;
+    double dy_world = sy * dx_body + cy * dy_body;
+
+    response->x = dx_world;
+    response->y = dy_world;
+    response->success = true;
+
+    RCLCPP_INFO(this->get_logger(),
+        "Detected %s | Camera(%.2f, %.2f) -> Body(%.2f, %.2f) -> World(%.2f, %.2f), yaw=%.1f°",
+        color.c_str(),
+        service_x_, service_y_,
+        dx_body, dy_body,
+        dx_world, dy_world,
+        yaw * 180.0 / M_PI);
+} else {
+    response->success = false;
+    RCLCPP_WARN(this->get_logger(), "No %s object detected", color.c_str());
+}
+    }
 };
 
-/**
- * @brief Send a command to switch to offboard mode
- */
-void OffboardControl::switch_to_offboard_mode(){
-	RCLCPP_INFO(this->get_logger(), "requesting switch to Offboard mode");
-	request_vehicle_command(VehicleCommand::VEHICLE_CMD_DO_SET_MODE, 1, 6);
-}
-
-/**
- * @brief Send a command to Arm the vehicle
- */
-void OffboardControl::arm()
-{
-	RCLCPP_INFO(this->get_logger(), "requesting arm");
-	request_vehicle_command(VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0);
-}
-
-/**
- * @brief Send a command to Disarm the vehicle
- */
-void OffboardControl::disarm()
-{
-	RCLCPP_INFO(this->get_logger(), "requesting disarm");
-	request_vehicle_command(VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0);
-}
-
-/**
- * @brief Publish the offboard control mode.
- *        For this example, only position and altitude controls are active.
- */
-void OffboardControl::publish_offboard_control_mode()
-{
-	OffboardControlMode msg{};
-	msg.position = true;
-	msg.velocity = false;
-	msg.acceleration = false;
-	msg.attitude = false;
-	msg.body_rate = false;
-	msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
-	offboard_control_mode_publisher_->publish(msg);
-}
-
-/**
- * @brief Publish a trajectory setpoint
- *        For this example, it sends a trajectory setpoint to make the
- *        vehicle hover at 5 meters with a yaw angle of 180 degrees.
- */
-void OffboardControl::publish_trajectory_setpoint()
-{
-	TrajectorySetpoint msg{};
-	msg.position = {0.0, 0.0, -5.0};
-	msg.yaw = -3.14; // [-PI:PI]
-	msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
-	trajectory_setpoint_publisher_->publish(msg);
-}
-
-/**
- * @brief Publish vehicle commands
- * @param command   Command code (matches VehicleCommand and MAVLink MAV_CMD codes)
- * @param param1    Command parameter 1
- * @param param2    Command parameter 2
- */
-void OffboardControl::request_vehicle_command(uint16_t command, float param1, float param2)
-{
-	auto request = std::make_shared<px4_msgs::srv::VehicleCommand::Request>();
-
-	VehicleCommand msg{};
-	msg.param1 = param1;
-	msg.param2 = param2;
-	msg.command = command;
-	msg.target_system = 1;
-	msg.target_component = 1;
-	msg.source_system = 1;
-	msg.source_component = 1;
-	msg.from_external = true;
-	msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
-	request->request = msg;
-
-	service_done_ = false;
-	auto result = vehicle_command_client_->async_send_request(request, std::bind(&OffboardControl::response_callback, this,
-                           std::placeholders::_1));
-	RCLCPP_INFO(this->get_logger(), "Command send");
-}
-
-void OffboardControl::timer_callback(void){
-	static uint8_t num_of_steps = 0;
-
-	// offboard_control_mode needs to be paired with trajectory_setpoint
-	publish_offboard_control_mode();
-	publish_trajectory_setpoint();
-
-	switch (state_)
-	{
-	case State::init :
-		switch_to_offboard_mode();
-		state_ = State::offboard_requested;
-		break;
-	case State::offboard_requested :
-		if(service_done_){
-			if (service_result_==0){
-				RCLCPP_INFO(this->get_logger(), "Entered offboard mode");
-				state_ = State::wait_for_stable_offboard_mode;				
-			}
-			else{
-				RCLCPP_ERROR(this->get_logger(), "Failed to enter offboard mode, exiting");
-				rclcpp::shutdown();
-			}
-		}
-		break;
-	case State::wait_for_stable_offboard_mode :
-		if (++num_of_steps>10){
-			arm();
-			state_ = State::arm_requested;
-		}
-		break;
-	case State::arm_requested :
-		if(service_done_){
-			if (service_result_==0){
-				RCLCPP_INFO(this->get_logger(), "vehicle is armed");
-				state_ = State::armed;
-			}
-			else{
-				RCLCPP_ERROR(this->get_logger(), "Failed to arm, exiting");
-				rclcpp::shutdown();
-			}
-		}
-		break;
-	default:
-		break;
-	}
-}
-
-void OffboardControl::response_callback(
-      rclcpp::Client<px4_msgs::srv::VehicleCommand>::SharedFuture future) {
-    auto status = future.wait_for(1s);
-    if (status == std::future_status::ready) {
-	  auto reply = future.get()->reply;
-	  service_result_ = reply.result;
-      switch (service_result_)
-		{
-		case reply.VEHICLE_CMD_RESULT_ACCEPTED:
-			RCLCPP_INFO(this->get_logger(), "command accepted");
-			break;
-		case reply.VEHICLE_CMD_RESULT_TEMPORARILY_REJECTED:
-			RCLCPP_WARN(this->get_logger(), "command temporarily rejected");
-			break;
-		case reply.VEHICLE_CMD_RESULT_DENIED:
-			RCLCPP_WARN(this->get_logger(), "command denied");
-			break;
-		case reply.VEHICLE_CMD_RESULT_UNSUPPORTED:
-			RCLCPP_WARN(this->get_logger(), "command unsupported");
-			break;
-		case reply.VEHICLE_CMD_RESULT_FAILED:
-			RCLCPP_WARN(this->get_logger(), "command failed");
-			break;
-		case reply.VEHICLE_CMD_RESULT_IN_PROGRESS:
-			RCLCPP_WARN(this->get_logger(), "command in progress");
-			break;
-		case reply.VEHICLE_CMD_RESULT_CANCELLED:
-			RCLCPP_WARN(this->get_logger(), "command cancelled");
-			break;
-		default:
-			RCLCPP_WARN(this->get_logger(), "command reply unknown");
-			break;
-		}
-      service_done_ = true;
-    } else {
-      RCLCPP_INFO(this->get_logger(), "Service In-Progress...");
-    }
-  }
-
-int main(int argc, char *argv[])
-{
-	setvbuf(stdout, NULL, _IONBF, BUFSIZ);
-	rclcpp::init(argc, argv);
-	rclcpp::spin(std::make_shared<OffboardControl>("/fmu/"));
-
-	rclcpp::shutdown();
-	return 0;
+int main(int argc, char *argv[]) {
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<ColorDetectionService>();
+    rclcpp::spin(node);
+    rclcpp::shutdown();
+    return 0;
 }
