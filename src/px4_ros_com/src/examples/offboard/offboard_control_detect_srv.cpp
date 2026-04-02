@@ -15,7 +15,6 @@
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
-#include "fix-tf-static.hpp"
 
 using namespace std::chrono_literals;
 using DetectColor = px4_msgs::srv::DetectColor;
@@ -40,19 +39,9 @@ public:
             std::bind(&ColorDetectionService::odom_callback, this, std::placeholders::_1));
 
         // TF 相关初始化
-         static_tf_helper_ = std::make_shared<StaticCameraTFHelper>(this);
-
          tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
          tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-
-        // 发布静态相机 -> 机体变换
-        // 后续需要改参数
-         static_tf_helper_->publishCameraToBodyTF(
-        "uav_base_link",   // 父坐标系：机体
-         "camera_link",     // 子坐标系：相机
-        0.0, 0.0, 0.0,     // x y z
-         0.0, 0.0, 0.0      // roll pitch yaw);
-
+        
         // 初始化颜色阈值映射表
         color_thresholds_["red"]   = std::make_pair(cv::Scalar(0, 200, 150),  cv::Scalar(10, 255, 230));
         color_thresholds_["green"] = std::make_pair(cv::Scalar(50, 200, 150), cv::Scalar(70, 255, 230));
@@ -69,7 +58,6 @@ public:
 
 private:
     // --- 新增 TF 成员 --- 
-    std::shared_ptr<StaticCameraTFHelper> static_tf_helper_;
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
     // --- ROS 组件 ---

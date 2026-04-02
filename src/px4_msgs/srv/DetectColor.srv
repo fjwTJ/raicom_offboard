@@ -1,0 +1,5 @@
+string color   # 请求的颜色 (red, green, blue, black)
+---
+float32 x      # 物体在无人机坐标系中的X坐标 (米)
+float32 y      # 物体在无人机坐标系中的Y坐标 (米)
+bool success   # 是否检测成功

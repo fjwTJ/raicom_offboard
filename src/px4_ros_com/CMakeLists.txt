@@ -29,6 +29,9 @@ find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(cv_bridge REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+find_package(OpenCV REQUIRED)
 
 #################
 # Setup targets #
@@ -83,7 +86,29 @@ install(TARGETS
   fix_tf_static
   DESTINATION lib/${PROJECT_NAME}
 )
+# examples/offboard/offboard_control_detect_srv
+add_executable(offboard_control_detect_srv
+  src/examples/offboard/offboard_control_detect_srv.cpp
+)
 
+ament_target_dependencies(offboard_control_detect_srv
+  rclcpp
+  sensor_msgs
+  cv_bridge
+  px4_msgs
+  geometry_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+)
+
+target_link_libraries(offboard_control_detect_srv
+  ${OpenCV_LIBS}
+)
+
+install(TARGETS offboard_control_detect_srv
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 ############
 # Install ##
