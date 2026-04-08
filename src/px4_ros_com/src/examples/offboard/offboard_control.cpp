@@ -13,6 +13,7 @@ using namespace std::chrono;
 using namespace std::chrono_literals;
 using namespace px4_msgs::msg;
 
+// Forward declaration of the OffboardControl class
 class OffboardControl : public rclcpp::Node
 {
 public:
