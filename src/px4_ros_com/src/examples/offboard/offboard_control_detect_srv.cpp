@@ -192,67 +192,139 @@ private:
             active_color_ = color;
         }
 
-        bool success = process_frame(frame_copy, color);
+        // ===== 多帧检测参数 =====
+        const int REQUIRED_SUCCESS = 5;
+        const int MAX_LOST = 3;
+        const double TIMEOUT = 2.0;
 
-       //相机->机体->世界坐标变换
-        if (success) {
-           geometry_msgs::msg::PointStamped point_cam;
-           geometry_msgs::msg::PointStamped point_body;
+        int success_count = 0;
+        int lost_count = 0;
 
-             // 1. 把检测结果封装成 camera_link 下的点
-    point_cam.header.stamp = this->get_clock()->now();
-    point_cam.header.frame_id = "camera_link";
-    point_cam.point.x = service_x_;
-    point_cam.point.y = service_y_;
-    point_cam.point.z = 0.0;   // 当前先按二维平面处理
+        std::vector<double> xs, ys;
 
-    // 2. 查询 camera_link -> uav_base_link 的变换
-    try {
-        auto transform = tf_buffer_->lookupTransform(
-            "uav_base_link",   // 目标坐标系
-            "camera_link",     // 源坐标系
-            tf2::TimePointZero);
+        auto start_time = this->now();
 
-        // 3. 把点从相机系变到机体系
-        tf2::doTransform(point_cam, point_body, transform);
-    } catch (const tf2::TransformException & ex) {
-        response->success = false;
-        RCLCPP_ERROR(this->get_logger(), "TF transform failed: %s", ex.what());
-        return;
+        // ===== 多帧检测循环 =====
+        while ((this->now() - start_time).seconds() < TIMEOUT) {
+
+        cv::Mat frame;
+        {
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        if (current_frame_.empty()) {
+            rclcpp::sleep_for(10ms);
+            continue;
+        }
+        frame = current_frame_.clone();
+       }
+
+        bool ok = process_frame(frame, color);
+
+        if (ok) {
+        success_count++;
+        lost_count = 0;
+
+        xs.push_back(service_x_);
+        ys.push_back(service_y_);
+
+        RCLCPP_INFO(this->get_logger(),
+            "[识别中] 第 %d/%d 帧成功 (%.2f, %.2f)",
+            success_count, REQUIRED_SUCCESS,
+            service_x_, service_y_);
+
+        if (success_count >= REQUIRED_SUCCESS) {
+            break;
+        }
+
+        } else {
+        lost_count++;
+
+        RCLCPP_WARN(this->get_logger(),
+            "[识别中断] 丢失第 %d 帧", lost_count);
+
+        if (lost_count >= MAX_LOST) {
+            RCLCPP_WARN(this->get_logger(),
+                "[识别中断] 连续丢失超过阈值，重置计数器");
+
+            success_count = 0;
+            lost_count = 0;
+            xs.clear();
+            ys.clear();
+        }
     }
 
-    // 4. 现在才真正得到机体系偏移
-    double dx_body = point_body.point.x;
-    double dy_body = point_body.point.y;
-
-    // --- 获取当前yaw ---
-    double yaw = 0.0;
-    {
-        std::lock_guard<std::mutex> lock(odom_mutex_);
-        yaw = current_yaw_;
-    }
-
-    // --- 机体 -> 世界NED ---
-    double cy = std::cos(yaw);
-    double sy = std::sin(yaw);
-    double dx_world = cy * dx_body - sy * dy_body;
-    double dy_world = sy * dx_body + cy * dy_body;
-
-    response->x = dx_world;
-    response->y = dy_world;
-    response->success = true;
-
-    RCLCPP_INFO(this->get_logger(),
-        "Detected %s | Camera(%.2f, %.2f) -> Body(%.2f, %.2f) -> World(%.2f, %.2f), yaw=%.1f°",
-        color.c_str(),
-        service_x_, service_y_,
-        dx_body, dy_body,
-        dx_world, dy_world,
-        yaw * 180.0 / M_PI);
-} else {
-    response->success = false;
-    RCLCPP_WARN(this->get_logger(), "No %s object detected", color.c_str());
+    rclcpp::sleep_for(10ms);
 }
+
+// ===== 超时判断 =====
+if (success_count < REQUIRED_SUCCESS) {
+    response->success = false;
+    RCLCPP_ERROR(this->get_logger(), "[失败] 超时未完成稳定识别");
+    return;
+}
+
+// ===== 平均滤波 =====
+double avg_x = 0.0, avg_y = 0.0;
+for (size_t i = 0; i < xs.size(); i++) {
+    avg_x += xs[i];
+    avg_y += ys[i];
+}
+avg_x /= xs.size();
+avg_y /= ys.size();
+
+service_x_ = avg_x;
+service_y_ = avg_y;
+
+RCLCPP_INFO(this->get_logger(),
+    "[识别完成] 平均结果 Camera(%.2f, %.2f)",
+    service_x_, service_y_);
+
+// ===== 坐标变换（保持你原逻辑）=====
+geometry_msgs::msg::PointStamped point_cam;
+geometry_msgs::msg::PointStamped point_body;
+
+point_cam.header.stamp = this->get_clock()->now();
+point_cam.header.frame_id = "camera_link";
+point_cam.point.x = service_x_;
+point_cam.point.y = service_y_;
+point_cam.point.z = 0.0;
+
+try {
+    auto transform = tf_buffer_->lookupTransform(
+        "uav_base_link",
+        "camera_link",
+        tf2::TimePointZero);
+
+    tf2::doTransform(point_cam, point_body, transform);
+
+} catch (const tf2::TransformException & ex) {
+    response->success = false;
+    RCLCPP_ERROR(this->get_logger(), "TF transform failed: %s", ex.what());
+    return;
+}
+
+double dx_body = point_body.point.x;
+double dy_body = point_body.point.y;
+
+double yaw = 0.0;
+{
+    std::lock_guard<std::mutex> lock(odom_mutex_);
+    yaw = current_yaw_;
+}
+
+double cy = std::cos(yaw);
+double sy = std::sin(yaw);
+
+double dx_world = cy * dx_body - sy * dy_body;
+double dy_world = sy * dx_body + cy * dy_body;
+
+response->x = dx_world;
+response->y = dy_world;
+response->success = true;
+
+RCLCPP_INFO(this->get_logger(),
+    "[最终结果] World(%.2f, %.2f), yaw=%.1f°",
+    dx_world, dy_world,
+    yaw * 180.0 / M_PI);
     }
 };
 
