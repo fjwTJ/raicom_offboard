@@ -32,7 +32,14 @@ find_package(tf2_ros REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(rclcpp_action REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
 
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "action/TrackColor.action"
+)
+
+rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
 #################
 # Setup targets #
 #################
@@ -70,7 +77,17 @@ install(TARGETS offboard_control DESTINATION lib/${PROJECT_NAME})
 
 # examples/offboard/offboard_control_srv
 add_executable(offboard_control_srv src/examples/offboard/offboard_control_srv.cpp)
-ament_target_dependencies(offboard_control_srv rclcpp px4_msgs)
+
+ament_target_dependencies(offboard_control_srv
+  rclcpp
+  rclcpp_action
+  px4_msgs
+)
+
+target_link_libraries(offboard_control_srv
+  ${cpp_typesupport_target}
+)
+
 install(TARGETS offboard_control_srv DESTINATION lib/${PROJECT_NAME})
 # examples/offboard/fix_tf_static
 add_executable(fix_tf_static src/examples/offboard/fix-tf-static.cpp)
@@ -93,6 +110,7 @@ add_executable(offboard_control_detect_srv
 
 ament_target_dependencies(offboard_control_detect_srv
   rclcpp
+  rclcpp_action
   sensor_msgs
   cv_bridge
   px4_msgs
@@ -104,12 +122,12 @@ ament_target_dependencies(offboard_control_detect_srv
 
 target_link_libraries(offboard_control_detect_srv
   ${OpenCV_LIBS}
+  ${cpp_typesupport_target}
 )
 
 install(TARGETS offboard_control_detect_srv
   DESTINATION lib/${PROJECT_NAME}
 )
-
 ############
 # Install ##
 ############
@@ -160,12 +178,18 @@ endif()
 ###########
 
 # Install Python modules
-ament_python_install_package(${PROJECT_NAME})
 
 # Install Python executables
-install(PROGRAMS
-  src/examples/offboard_py/offboard_control.py
-  DESTINATION lib/${PROJECT_NAME}
-)
 
-ament_package()
+
+ament_export_dependencies(
+  ament_cmake
+  rclcpp
+  rclcpp_action
+  rosidl_default_runtime
+  eigen3_cmake_module
+  Eigen3
+  px4_msgs
+  geometry_msgs
+  sensor_msgs
+)

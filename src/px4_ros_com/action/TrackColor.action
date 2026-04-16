@@ -1,0 +1,24 @@
+# ===== Goal =====
+string color
+float32 centered_tolerance
+int32 stable_count_required
+float32 timeout_sec
+float32 feedback_interval_sec
+
+---
+# ===== Result =====
+bool success
+string message
+float32 final_target_x_world
+float32 final_target_y_world
+int32 final_stable_count
+
+---
+# ===== Feedback =====
+bool detected
+float32 target_x_world
+float32 target_y_world
+float32 offset_x_body
+float32 offset_y_body
+float32 planar_error
+int32 stable_count
