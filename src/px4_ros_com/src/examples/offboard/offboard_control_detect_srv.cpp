@@ -4,7 +4,6 @@
 #include "cv_bridge/cv_bridge.h"
 #include "opencv2/opencv.hpp"
 #include "opencv2/imgproc.hpp"
-#include "px4_msgs/srv/detect_color.hpp"
 #include "px4_msgs/msg/vehicle_odometry.hpp"
 #include "geometry_msgs/msg/point_stamped.hpp"
 #include "tf2_ros/buffer.h"
@@ -21,29 +20,23 @@
 #include <thread>
 
 using namespace std::chrono_literals;
-using DetectColor = px4_msgs::srv::DetectColor;
 using TrackColor = px4_ros_com::action::TrackColor;
 using GoalHandleTrackColor = rclcpp_action::ServerGoalHandle<TrackColor>;
 
-class ColorDetectionService : public rclcpp::Node {
+class ColorDetectionActionServer : public rclcpp::Node {
 public:
-    ColorDetectionService() : Node("color_detection_service") {
-        service_ = this->create_service<DetectColor>(
-            "detect_color",
-            std::bind(&ColorDetectionService::handle_detect_color, this,
-                      std::placeholders::_1, std::placeholders::_2));
-
+    ColorDetectionActionServer() : Node("color_detection_service")
+    {
         subscription_ = this->create_subscription<sensor_msgs::msg::Image>(
             "/camera", 10,
-            std::bind(&ColorDetectionService::image_callback, this, std::placeholders::_1));
+            std::bind(&ColorDetectionActionServer::image_callback, this, std::placeholders::_1));
 
-        // 与 PX4 的 sensor_data QoS 对齐
         rmw_qos_profile_t qos_profile = rmw_qos_profile_sensor_data;
         auto qos = rclcpp::QoS(rclcpp::QoSInitialization(qos_profile.history, 5), qos_profile);
 
         odom_sub_ = this->create_subscription<px4_msgs::msg::VehicleOdometry>(
             "/fmu/out/vehicle_odometry", qos,
-            std::bind(&ColorDetectionService::odom_callback, this, std::placeholders::_1));
+            std::bind(&ColorDetectionActionServer::odom_callback, this, std::placeholders::_1));
 
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -51,9 +44,9 @@ public:
         action_server_ = rclcpp_action::create_server<TrackColor>(
             this,
             "track_color",
-            std::bind(&ColorDetectionService::handle_goal, this, std::placeholders::_1, std::placeholders::_2),
-            std::bind(&ColorDetectionService::handle_cancel, this, std::placeholders::_1),
-            std::bind(&ColorDetectionService::handle_accepted, this, std::placeholders::_1));
+            std::bind(&ColorDetectionActionServer::handle_goal, this, std::placeholders::_1, std::placeholders::_2),
+            std::bind(&ColorDetectionActionServer::handle_cancel, this, std::placeholders::_1),
+            std::bind(&ColorDetectionActionServer::handle_accepted, this, std::placeholders::_1));
 
         color_thresholds_["red"]   = std::make_pair(cv::Scalar(0, 200, 150),   cv::Scalar(10, 255, 230));
         color_thresholds_["green"] = std::make_pair(cv::Scalar(50, 200, 150),  cv::Scalar(70, 255, 230));
@@ -61,35 +54,35 @@ public:
         color_thresholds_["black"] = std::make_pair(cv::Scalar(0, 0, 50),      cv::Scalar(180, 50, 100));
 
         cv::namedWindow("Camera Feed", cv::WINDOW_AUTOSIZE);
-        RCLCPP_INFO(this->get_logger(), "Color detection service + action ready.");
+        RCLCPP_INFO(this->get_logger(), "TrackColor action server ready.");
     }
 
-    ~ColorDetectionService() {
+    ~ColorDetectionActionServer() {
         cv::destroyAllWindows();
     }
 
 private:
-    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
-    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
-
-    rclcpp::Service<DetectColor>::SharedPtr service_;
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr subscription_;
     rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr odom_sub_;
     rclcpp_action::Server<TrackColor>::SharedPtr action_server_;
 
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+
     cv::Mat current_frame_;
     std::mutex frame_mutex_;
 
-    double current_yaw_ = 0.0;
+    double current_yaw_{0.0};
     std::mutex odom_mutex_;
 
     std::map<std::string, std::pair<cv::Scalar, cv::Scalar>> color_thresholds_;
+
     std::atomic<bool> detection_active_{false};
     std::string active_color_;
     std::mutex detection_mutex_;
 
-    double service_x_{0.0};
-    double service_y_{0.0};
+    double latest_cam_x_{0.0};
+    double latest_cam_y_{0.0};
 
     void image_callback(const sensor_msgs::msg::Image::SharedPtr msg) {
         try {
@@ -102,7 +95,7 @@ private:
             cv::Mat display_frame = current_frame_.clone();
             if (detection_active_) {
                 std::lock_guard<std::mutex> det_lock(detection_mutex_);
-                process_frame(display_frame, active_color_);
+                process_frame(display_frame, active_color_, false);
             }
 
             cv::imshow("Camera Feed", display_frame);
@@ -123,7 +116,7 @@ private:
         current_yaw_ = yaw;
     }
 
-    bool process_frame(cv::Mat &image, const std::string &color) {
+    bool process_frame(cv::Mat &image, const std::string &color, bool annotate = true) {
         if (color_thresholds_.find(color) == color_thresholds_.end()) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                                  "Unsupported color: %s", color.c_str());
@@ -143,8 +136,10 @@ private:
         cv::findContours(mask_color, contours, cv::RETR_LIST, cv::CHAIN_APPROX_NONE);
 
         if (contours.empty()) {
-            cv::putText(image, "No " + color + " object", cv::Point(20, 40),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 255), 2);
+            if (annotate) {
+                cv::putText(image, "No " + color + " object", cv::Point(20, 40),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 255), 2);
+            }
             return false;
         }
 
@@ -166,12 +161,13 @@ private:
         double pixel_to_meter_x = 1.0 / std::max(w, 1);
         double pixel_to_meter_y = 1.0 / std::max(h, 1);
 
-        // 这里先近似得到 camera_link 平面下的偏移
-        service_x_ = rel_x * pixel_to_meter_x;
-        service_y_ = rel_y * pixel_to_meter_y;
+        latest_cam_x_ = rel_x * pixel_to_meter_x;
+        latest_cam_y_ = rel_y * pixel_to_meter_y;
 
-        cv::rectangle(image, rect, cv::Scalar(0, 255, 0), 2);
-        cv::circle(image, cv::Point(obj_cx, obj_cy), 5, cv::Scalar(0, 255, 0), -1);
+        if (annotate) {
+            cv::rectangle(image, rect, cv::Scalar(0, 255, 0), 2);
+            cv::circle(image, cv::Point(obj_cx, obj_cy), 5, cv::Scalar(0, 255, 0), -1);
+        }
         return true;
     }
 
@@ -196,8 +192,8 @@ private:
             active_color_ = color;
         }
 
-        bool success = process_frame(frame_copy, color);
-        if (!success) {
+        bool ok = process_frame(frame_copy, color, true);
+        if (!ok) {
             return false;
         }
 
@@ -206,8 +202,8 @@ private:
 
         point_cam.header.stamp = this->get_clock()->now();
         point_cam.header.frame_id = "camera_link";
-        point_cam.point.x = service_x_;
-        point_cam.point.y = service_y_;
+        point_cam.point.x = latest_cam_x_;
+        point_cam.point.y = latest_cam_y_;
         point_cam.point.z = 0.0;
 
         try {
@@ -239,57 +235,34 @@ private:
         return true;
     }
 
-    void handle_detect_color(const std::shared_ptr<DetectColor::Request> request,
-                             std::shared_ptr<DetectColor::Response> response) {
-        std::string color = request->color;
-        RCLCPP_INFO(this->get_logger(), "Service request for color: %s", color.c_str());
-
-        if (color_thresholds_.find(color) == color_thresholds_.end()) {
-            response->success = false;
-            RCLCPP_WARN(this->get_logger(), "Unsupported color: %s", color.c_str());
-            return;
-        }
-
-        double dx_body = 0.0, dy_body = 0.0, dx_world = 0.0, dy_world = 0.0;
-        bool success = detect_once_and_transform(color, dx_body, dy_body, dx_world, dy_world);
-
-        if (success) {
-            response->x = dx_world;
-            response->y = dy_world;
-            response->success = true;
-
-            RCLCPP_INFO(this->get_logger(),
-                        "Detected %s | Camera(%.2f, %.2f) -> Body(%.2f, %.2f) -> World(%.2f, %.2f)",
-                        color.c_str(), service_x_, service_y_, dx_body, dy_body, dx_world, dy_world);
-        } else {
-            response->success = false;
-            RCLCPP_WARN(this->get_logger(), "No %s object detected", color.c_str());
-        }
-    }
-
     rclcpp_action::GoalResponse handle_goal(
         const rclcpp_action::GoalUUID &,
         std::shared_ptr<const TrackColor::Goal> goal)
     {
+        if (color_thresholds_.find(goal->color) == color_thresholds_.end()) {
+            RCLCPP_WARN(this->get_logger(), "Reject goal: unsupported color %s", goal->color.c_str());
+            return rclcpp_action::GoalResponse::REJECT;
+        }
+
         RCLCPP_INFO(this->get_logger(),
-                    "Received TrackColor goal: color=%s tolerance=%.3f stable_count=%d timeout=%.2f",
+                    "Accept TrackColor goal: color=%s tolerance=%.3f stable=%d timeout=%.2f",
                     goal->color.c_str(),
                     goal->centered_tolerance,
                     goal->stable_count_required,
                     goal->timeout_sec);
+
         return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
     }
 
     rclcpp_action::CancelResponse handle_cancel(
-        const std::shared_ptr<GoalHandleTrackColor> goal_handle)
+        const std::shared_ptr<GoalHandleTrackColor>)
     {
-        (void)goal_handle;
-        RCLCPP_INFO(this->get_logger(), "Received request to cancel TrackColor");
+        RCLCPP_INFO(this->get_logger(), "Cancel TrackColor goal");
         return rclcpp_action::CancelResponse::ACCEPT;
     }
 
     void handle_accepted(const std::shared_ptr<GoalHandleTrackColor> goal_handle) {
-        std::thread{std::bind(&ColorDetectionService::execute_track_color, this, std::placeholders::_1), goal_handle}.detach();
+        std::thread{std::bind(&ColorDetectionActionServer::execute_track_color, this, std::placeholders::_1), goal_handle}.detach();
     }
 
     void execute_track_color(const std::shared_ptr<GoalHandleTrackColor> goal_handle) {
@@ -298,27 +271,26 @@ private:
         auto result = std::make_shared<TrackColor::Result>();
 
         rclcpp::Rate rate(1.0 / std::max(0.05f, goal->feedback_interval_sec));
-
         auto start_time = this->now();
         int stable_count = 0;
 
         while (rclcpp::ok()) {
             if (goal_handle->is_canceling()) {
+                detection_active_ = false;
                 result->success = false;
                 result->message = "cancelled";
                 result->final_stable_count = stable_count;
                 goal_handle->canceled(result);
-                RCLCPP_INFO(this->get_logger(), "TrackColor goal canceled");
                 return;
             }
 
             double elapsed = (this->now() - start_time).seconds();
             if (elapsed > goal->timeout_sec) {
+                detection_active_ = false;
                 result->success = false;
                 result->message = "timeout";
                 result->final_stable_count = stable_count;
                 goal_handle->abort(result);
-                RCLCPP_WARN(this->get_logger(), "TrackColor timeout");
                 return;
             }
 
@@ -335,33 +307,31 @@ private:
             if (detected) {
                 stable_count = (planar_error < goal->centered_tolerance) ? (stable_count + 1) : 0;
                 feedback->stable_count = stable_count;
-
-                // 返回的是“相对当前无人机的世界系偏移”
-                // 控制节点会再加上 odometry 位置得到绝对目标点
-                feedback->target_x_world = static_cast<float>(dx_world);
-                feedback->target_y_world = static_cast<float>(dy_world);
+                feedback->offset_x_world = static_cast<float>(dx_world);
+                feedback->offset_y_world = static_cast<float>(dy_world);
 
                 if (stable_count >= goal->stable_count_required) {
+                    detection_active_ = false;
                     result->success = true;
                     result->message = "target centered";
-                    result->final_target_x_world = static_cast<float>(dx_world);
-                    result->final_target_y_world = static_cast<float>(dy_world);
+                    result->final_offset_x_world = static_cast<float>(dx_world);
+                    result->final_offset_y_world = static_cast<float>(dy_world);
                     result->final_stable_count = stable_count;
                     goal_handle->succeed(result);
-                    RCLCPP_INFO(this->get_logger(), "TrackColor succeeded");
                     return;
                 }
             } else {
                 stable_count = 0;
-                feedback->stable_count = stable_count;
-                feedback->target_x_world = 0.0f;
-                feedback->target_y_world = 0.0f;
+                feedback->stable_count = 0;
+                feedback->offset_x_world = 0.0f;
+                feedback->offset_y_world = 0.0f;
             }
 
             goal_handle->publish_feedback(feedback);
             rate.sleep();
         }
 
+        detection_active_ = false;
         result->success = false;
         result->message = "node shutdown";
         result->final_stable_count = stable_count;
@@ -371,7 +341,7 @@ private:
 
 int main(int argc, char *argv[]) {
     rclcpp::init(argc, argv);
-    auto node = std::make_shared<ColorDetectionService>();
+    auto node = std::make_shared<ColorDetectionActionServer>();
     rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;

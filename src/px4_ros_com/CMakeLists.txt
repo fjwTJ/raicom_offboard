@@ -22,11 +22,9 @@ find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(px4_msgs REQUIRED)
-find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(rclpy REQUIRED)
 find_package(rclcpp REQUIRED)
-find_package(geometry_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(cv_bridge REQUIRED)
@@ -181,15 +179,4 @@ endif()
 
 # Install Python executables
 
-
-ament_export_dependencies(
-  ament_cmake
-  rclcpp
-  rclcpp_action
-  rosidl_default_runtime
-  eigen3_cmake_module
-  Eigen3
-  px4_msgs
-  geometry_msgs
-  sensor_msgs
-)
+ament_package()
